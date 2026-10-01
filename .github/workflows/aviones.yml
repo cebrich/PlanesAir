@@ -1,1 +1,24 @@
-kk
+name: aviones
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # cada hora; cada ejecución hace bucle ~55 min
+  workflow_dispatch:
+
+# Si una ejecución se retrasa, la siguiente espera en vez de solaparse
+concurrency:
+  group: aviones
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 59
+    steps:
+      - uses: actions/checkout@v4
+      - name: Vigilar aviones
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DURATION_S: "3300"
+        run: python3 poll.py
