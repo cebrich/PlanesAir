@@ -18,6 +18,13 @@ INTERVAL = int(os.getenv("INTERVAL_S", "15"))        # segundos entre consultas
 DURATION = int(os.getenv("DURATION_S", "3300"))      # duración de cada ejecución
 COOLDOWN = int(os.getenv("COOLDOWN_S", "900"))       # no repetir aviso del mismo avión
 MAX_LOC_AGE = int(os.getenv("MAX_LOC_AGE_S", "600")) # ubicación más vieja que esto = ignorar
+PHOTO_MODE = os.getenv("PHOTO_MODE", "preview")      # "preview" = enlace con vista previa; "photo" = sendPhoto
+
+# Planespotters exige un User-Agent único con URL o email de contacto.
+# En GitHub Actions GITHUB_REPOSITORY existe solo (usuario/repositorio).
+_repo = os.getenv("GITHUB_REPOSITORY")
+CONTACT = os.getenv("CONTACT") or (f"https://github.com/{_repo}" if _repo else "sin-contacto")
+USER_AGENT = f"AvionesTelegram/1.0 (+{CONTACT})"
 
 # Todas devuelven el formato ADSBExchange v2. Se prueban en orden y, si una
 # responde 429/403 (IPs compartidas de GitHub), se aparta un rato y se usa la siguiente.
@@ -35,14 +42,18 @@ photo_cache = {}  # hex -> (url_foto, url_pagina, fotógrafo) o None
 
 
 def http_json(url, data=None, timeout=15):
-    req = urllib.request.Request(url, data=data, headers={"User-Agent": "aviones-telegram/1.0"})
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)
 
 
 def tg(method, **params):
     data = urllib.parse.urlencode(params).encode()
-    return http_json(f"https://api.telegram.org/bot{TOKEN}/{method}", data)
+    try:
+        return http_json(f"https://api.telegram.org/bot{TOKEN}/{method}", data)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"Telegram {method}: HTTP {e.code} {body}") from None
 
 
 def refresh_location():
@@ -129,6 +140,7 @@ def get_photo(hex_code):
     except Exception as e:
         print(f"Foto no disponible ({hex_code}): {e}", file=sys.stderr)
         return None  # no se cachea el fallo: se reintenta la próxima vez
+    print(f"Foto {hex_code}: " + ("encontrada" if result else "sin foto en Planespotters"))
     photo_cache[hex_code] = result
     return result
 
@@ -137,12 +149,20 @@ def send_alert(hex_code, text):
     photo = get_photo(hex_code)
     if photo:
         src, link, author = photo
-        caption = f"{text}\n📷 {author} · Planespotters.net\n{link}"
+        credit = f"📷 {author} · Planespotters.net"
+        if PHOTO_MODE == "photo":
+            try:
+                tg("sendPhoto", chat_id=CHAT_ID, photo=src, caption=f"{text}\n{credit}\n{link}"[:1024])
+                return
+            except Exception as e:
+                print(f"sendPhoto falló, pruebo con vista previa del enlace: {e}", file=sys.stderr)
+        # Vista previa del enlace de la foto (Telegram muestra la imagen de la página)
         try:
-            tg("sendPhoto", chat_id=CHAT_ID, photo=src, caption=caption[:1024])
+            tg("sendMessage", chat_id=CHAT_ID, text=f"{text}\n{credit}\n{link}",
+               link_preview_options=json.dumps({"url": link, "prefer_large_media": True}))
             return
         except Exception as e:
-            print(f"sendPhoto falló, envío solo texto: {e}", file=sys.stderr)
+            print(f"Vista previa falló, envío solo texto: {e}", file=sys.stderr)
     tg("sendMessage", chat_id=CHAT_ID, text=text, disable_web_page_preview="true")
 
 
