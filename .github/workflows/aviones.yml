@@ -21,4 +21,5 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DURATION_S: "3300"
+          PHOTO_MODE: "preview"
         run: python3 poll.py
