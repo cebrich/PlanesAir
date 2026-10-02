@@ -6,6 +6,7 @@ import math
 import os
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -18,8 +19,15 @@ DURATION = int(os.getenv("DURATION_S", "3300"))      # duración de cada ejecuci
 COOLDOWN = int(os.getenv("COOLDOWN_S", "900"))       # no repetir aviso del mismo avión
 MAX_LOC_AGE = int(os.getenv("MAX_LOC_AGE_S", "600")) # ubicación más vieja que esto = ignorar
 
-# Ambas devuelven el mismo formato; si una falla se prueba la otra.
-SOURCES = ["https://api.adsb.lol/v2/point", "https://api.airplanes.live/v2/point"]
+# Todas devuelven el formato ADSBExchange v2. Se prueban en orden y, si una
+# responde 429/403 (IPs compartidas de GitHub), se aparta un rato y se usa la siguiente.
+SOURCES = [
+    ("adsb.fi", "https://opendata.adsb.fi/api/v2/lat/{lat}/lon/{lon}/dist/{nm}"),
+    ("adsb.lol", "https://api.adsb.lol/v2/point/{lat}/{lon}/{nm}"),
+    ("adsb.one", "https://api.adsb.one/v2/point/{lat}/{lon}/{nm}"),
+    ("airplanes.live", "https://api.airplanes.live/v2/point/{lat}/{lon}/{nm}"),
+]
+blocked_until = {}  # fuente -> timestamp hasta el que no se usa
 PUNTOS = ["N", "NE", "E", "SE", "S", "SO", "O", "NO"]
 
 last_loc = None  # (lat, lon, timestamp)
@@ -67,12 +75,25 @@ def compass(b):
 
 
 def fetch_aircraft(lat, lon):
-    radius_nm = math.ceil(RADIUS_KM / 1.852) + 1  # margen; luego se filtra con Haversine
-    for base in SOURCES:
+    nm = math.ceil(RADIUS_KM / 1.852) + 1  # margen; luego se filtra con Haversine
+    now = time.time()
+    for name, tpl in SOURCES:
+        if blocked_until.get(name, 0) > now:
+            continue
+        url = tpl.format(lat=f"{lat:.5f}", lon=f"{lon:.5f}", nm=nm)
         try:
-            return http_json(f"{base}/{lat:.5f}/{lon:.5f}/{radius_nm}").get("ac", [])
+            data = http_json(url)
+            ac = data.get("ac")
+            if ac is None:
+                ac = data.get("aircraft") or []
+            print(f"{name}: {len(ac)} aviones en el área")
+            return ac
+        except urllib.error.HTTPError as e:
+            blocked_until[name] = now + (600 if e.code == 403 else 60)
+            print(f"{name} falló: HTTP {e.code}", file=sys.stderr)
         except Exception as e:
-            print(f"Fuente {base} falló: {e}", file=sys.stderr)
+            blocked_until[name] = now + 30
+            print(f"{name} falló: {e}", file=sys.stderr)
     return None
 
 
