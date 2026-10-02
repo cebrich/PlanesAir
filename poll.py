@@ -102,7 +102,7 @@ def format_msg(ac, dist, brg):
     lines = [
         f"✈️ {flight} ({ac.get('t') or '?'}, {ac.get('r') or '?'})",
         f"📏 A {dist:.1f} km al {compass(brg)}",
-        f"⬇️ {int(ac['alt_baro'])} ft",
+        f"⬇️ {ac['alt_baro'] * 0.3048:.0f} m ({int(ac['alt_baro'])} ft)",
     ]
     gs, track = ac.get("gs"), ac.get("track")
     if gs is not None:
