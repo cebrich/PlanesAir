@@ -31,6 +31,7 @@ blocked_until = {}  # fuente -> timestamp hasta el que no se usa
 PUNTOS = ["N", "NE", "E", "SE", "S", "SO", "O", "NO"]
 
 last_loc = None  # (lat, lon, timestamp)
+photo_cache = {}  # hex -> (url_foto, url_pagina, fotógrafo) o None
 
 
 def http_json(url, data=None, timeout=15):
@@ -112,6 +113,39 @@ def format_msg(ac, dist, brg):
     return "\n".join(lines)
 
 
+def get_photo(hex_code):
+    """Última foto del avión en Planespotters.net (API pública, sin clave)."""
+    if hex_code in photo_cache:
+        return photo_cache[hex_code]
+    result = None
+    try:
+        data = http_json(f"https://api.planespotters.net/pub/photos/hex/{hex_code.upper()}", timeout=10)
+        photos = data.get("photos") or []
+        if photos:
+            p = photos[0]
+            thumb = p.get("thumbnail_large") or p.get("thumbnail") or {}
+            if thumb.get("src") and p.get("link"):
+                result = (thumb["src"], p["link"], p.get("photographer") or "autor desconocido")
+    except Exception as e:
+        print(f"Foto no disponible ({hex_code}): {e}", file=sys.stderr)
+        return None  # no se cachea el fallo: se reintenta la próxima vez
+    photo_cache[hex_code] = result
+    return result
+
+
+def send_alert(hex_code, text):
+    photo = get_photo(hex_code)
+    if photo:
+        src, link, author = photo
+        caption = f"{text}\n📷 {author} · Planespotters.net\n{link}"
+        try:
+            tg("sendPhoto", chat_id=CHAT_ID, photo=src, caption=caption[:1024])
+            return
+        except Exception as e:
+            print(f"sendPhoto falló, envío solo texto: {e}", file=sys.stderr)
+    tg("sendMessage", chat_id=CHAT_ID, text=text, disable_web_page_preview="true")
+
+
 def step(seen):
     refresh_location()
     if not last_loc or time.time() - last_loc[2] > MAX_LOC_AGE:
@@ -134,8 +168,7 @@ def step(seen):
         if now - seen.get(ac["hex"], 0) < COOLDOWN:
             continue
         brg = bearing(lat, lon, ac["lat"], ac["lon"])
-        tg("sendMessage", chat_id=CHAT_ID, text=format_msg(ac, dist, brg),
-           disable_web_page_preview="true")
+        send_alert(ac["hex"], format_msg(ac, dist, brg))
         seen[ac["hex"]] = now
 
 
