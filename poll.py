@@ -149,16 +149,15 @@ def send_alert(hex_code, text):
     photo = get_photo(hex_code)
     if photo:
         src, link, author = photo
-        credit = f"📷 {author} · Planespotters.net"
         if PHOTO_MODE == "photo":
             try:
-                tg("sendPhoto", chat_id=CHAT_ID, photo=src, caption=f"{text}\n{credit}\n{link}"[:1024])
+                tg("sendPhoto", chat_id=CHAT_ID, photo=src, caption=f"{text}"[:1024])
                 return
             except Exception as e:
                 print(f"sendPhoto falló, pruebo con vista previa del enlace: {e}", file=sys.stderr)
         # Vista previa del enlace de la foto (Telegram muestra la imagen de la página)
         try:
-            tg("sendMessage", chat_id=CHAT_ID, text=f"{text}\n{credit}\n{link}",
+            tg("sendMessage", chat_id=CHAT_ID, text=f"{text}",
                link_preview_options=json.dumps({"url": link, "prefer_large_media": True}))
             return
         except Exception as e:
