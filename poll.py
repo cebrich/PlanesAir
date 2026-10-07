@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-"""Avisa por Telegram de aviones a <= RADIUS_KM de tu ubicación en vivo
-y por debajo de MAX_ALT_FT. Solo usa la librería estándar."""
+"""Avisa por Telegram de aviones a <= RADIUS_KM de la ubicación en vivo de cada
+usuario autorizado y por debajo de MAX_ALT_FT. Solo usa la librería estándar.
+
+Usuarios: el dueño (TELEGRAM_CHAT_ID) y, opcionalmente, los miembros del grupo
+TELEGRAM_GROUP_ID. Cada uno se "suscribe" compartiendo su ubicación en tiempo
+real con el bot: no hace falta apuntar sus ids en ningún sitio."""
 import json
 import math
 import os
@@ -11,7 +15,8 @@ import urllib.parse
 import urllib.request
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = str(os.environ["TELEGRAM_CHAT_ID"])
+CHAT_ID = str(os.environ["TELEGRAM_CHAT_ID"])        # dueño: siempre autorizado
+GROUP_ID = os.getenv("TELEGRAM_GROUP_ID", "").strip()  # opcional: grupo privado con los demás usuarios
 RADIUS_KM = float(os.getenv("RADIUS_KM", "5"))
 MAX_ALT_FT = float(os.getenv("MAX_ALT_FT", "3200"))
 INTERVAL = int(os.getenv("INTERVAL_S", "15"))        # segundos entre consultas
@@ -37,7 +42,9 @@ SOURCES = [
 blocked_until = {}  # fuente -> timestamp hasta el que no se usa
 PUNTOS = ["N", "NE", "E", "SE", "S", "SO", "O", "NO"]
 
-last_loc = None  # (lat, lon, timestamp)
+locations = {}     # chat_id -> (lat, lon, timestamp) de cada usuario
+member_cache = {}  # user_id -> (autorizado, cuándo se comprobó)
+notified = set()   # usuarios no autorizados ya avisados en esta ejecución
 photo_cache = {}  # hex -> (url_foto, url_pagina, fotógrafo) o None
 
 
@@ -56,16 +63,53 @@ def tg(method, **params):
         raise RuntimeError(f"Telegram {method}: HTTP {e.code} {body}") from None
 
 
-def refresh_location():
-    """Lee el último update del bot; si es una ubicación tuya, la guarda."""
-    global last_loc
-    res = tg("getUpdates", offset=-1, allowed_updates=json.dumps(["message", "edited_message"]))
+def authorized(uid):
+    """Dueño, o miembro del grupo privado (comprobado con getChatMember, en caché 10 min)."""
+    if str(uid) == CHAT_ID:
+        return True
+    if not GROUP_ID:
+        return False
+    ok, checked = member_cache.get(uid, (False, 0))
+    if time.time() - checked < 600:
+        return ok
+    try:
+        r = tg("getChatMember", chat_id=GROUP_ID, user_id=uid)["result"]
+        ok = r["status"] in ("creator", "administrator", "member") or (
+            r["status"] == "restricted" and r.get("is_member", False))
+    except Exception as e:
+        print(f"No se pudo comprobar la pertenencia al grupo: {e}", file=sys.stderr)
+        ok = False
+    member_cache[uid] = (ok, time.time())
+    return ok
+
+
+def refresh_locations():
+    """Lee los últimos 100 updates (offset negativo: sin consumir ni perder estado)
+    y guarda la ubicación más reciente de cada usuario autorizado."""
+    res = tg("getUpdates", offset=-100, limit=100,
+             allowed_updates=json.dumps(["message", "edited_message"]))
     for u in res.get("result", []):
         m = u.get("edited_message") or u.get("message")
-        if not m or str(m["chat"]["id"]) != CHAT_ID or "location" not in m:
+        if not m or "location" not in m or m["chat"].get("type") != "private":
+            continue
+        uid = (m.get("from") or {}).get("id")
+        if uid is None:
+            continue
+        cid = str(m["chat"]["id"])
+        ts = m.get("edit_date") or m["date"]
+        if cid in locations and locations[cid][2] >= ts:
+            continue
+        if not authorized(uid):
+            if cid not in notified:
+                notified.add(cid)
+                try:
+                    tg("sendMessage", chat_id=cid,
+                       text="Este bot es privado. Pide al administrador que te añada al grupo.")
+                except Exception as e:
+                    print(f"No se pudo avisar a un usuario no autorizado: {e}", file=sys.stderr)
             continue
         loc = m["location"]
-        last_loc = (loc["latitude"], loc["longitude"], m.get("edit_date") or m["date"])
+        locations[cid] = (loc["latitude"], loc["longitude"], ts)
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -145,32 +189,28 @@ def get_photo(hex_code):
     return result
 
 
-def send_alert(hex_code, text):
+def send_alert(chat_id, hex_code, text):
     photo = get_photo(hex_code)
     if photo:
         src, link, author = photo
+        credit = f"📷 {author} · Planespotters.net"
         if PHOTO_MODE == "photo":
             try:
-                tg("sendPhoto", chat_id=CHAT_ID, photo=src, caption=f"{text}"[:1024])
+                tg("sendPhoto", chat_id=chat_id, photo=src, caption=f"{text}\n{credit}\n{link}"[:1024])
                 return
             except Exception as e:
                 print(f"sendPhoto falló, pruebo con vista previa del enlace: {e}", file=sys.stderr)
         # Vista previa del enlace de la foto (Telegram muestra la imagen de la página)
         try:
-            tg("sendMessage", chat_id=CHAT_ID, text=f"{text}",
+            tg("sendMessage", chat_id=chat_id, text=f"{text}\n{credit}\n{link}",
                link_preview_options=json.dumps({"url": link, "prefer_large_media": True}))
             return
         except Exception as e:
             print(f"Vista previa falló, envío solo texto: {e}", file=sys.stderr)
-    tg("sendMessage", chat_id=CHAT_ID, text=text, disable_web_page_preview="true")
+    tg("sendMessage", chat_id=chat_id, text=text, disable_web_page_preview="true")
 
 
-def step(seen):
-    refresh_location()
-    if not last_loc or time.time() - last_loc[2] > MAX_LOC_AGE:
-        print("Sin ubicación reciente; comparte tu ubicación en tiempo real con el bot.")
-        return
-    lat, lon, _ = last_loc
+def alert_user(cid, lat, lon, seen):
     aircraft = fetch_aircraft(lat, lon)
     if aircraft is None:
         return
@@ -184,11 +224,29 @@ def step(seen):
         dist = haversine_km(lat, lon, ac["lat"], ac["lon"])
         if dist > RADIUS_KM:
             continue
-        if now - seen.get(ac["hex"], 0) < COOLDOWN:
+        key = (cid, ac["hex"])
+        if now - seen.get(key, 0) < COOLDOWN:
             continue
         brg = bearing(lat, lon, ac["lat"], ac["lon"])
-        send_alert(ac["hex"], format_msg(ac, dist, brg))
-        seen[ac["hex"]] = now
+        send_alert(cid, ac["hex"], format_msg(ac, dist, brg))
+        seen[key] = now
+
+
+def step(seen):
+    refresh_locations()
+    now = time.time()
+    active = {cid: loc for cid, loc in locations.items() if now - loc[2] <= MAX_LOC_AGE}
+    if not active:
+        print("Sin ubicaciones recientes; comparte la ubicación en tiempo real con el bot.")
+        return
+    print(f"{len(active)} usuario(s) con ubicación reciente")
+    for i, (cid, (lat, lon, _)) in enumerate(active.items()):
+        if i:
+            time.sleep(1.1)  # las APIs permiten ~1 petición/segundo
+        try:
+            alert_user(cid, lat, lon, seen)
+        except Exception as e:  # un usuario con fallo no debe frenar a los demás
+            print(f"Error con un usuario: {e}", file=sys.stderr)
 
 
 def main():
