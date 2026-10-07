@@ -23,4 +23,5 @@ jobs:
           TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}  # opcional
           DURATION_S: "3300"
           PHOTO_MODE: "preview"
+          ONLY_HELICOPTERS: "0"   # 0 = aviones y helicópteros; 1 = solo helicópteros
         run: python3 poll.py
