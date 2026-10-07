@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Avisa por Telegram de aviones a <= RADIUS_KM de la ubicación en vivo de cada
+"""Avisa por Telegram de aviones y helicópteros (ONLY_HELICOPTERS=1 limita a helicópteros) a <= RADIUS_KM de la ubicación en vivo de cada
 usuario autorizado y por debajo de MAX_ALT_FT. Solo usa la librería estándar.
 
 Usuarios: el dueño (TELEGRAM_CHAT_ID) y, opcionalmente, los miembros del grupo
@@ -24,6 +24,20 @@ DURATION = int(os.getenv("DURATION_S", "3300"))      # duración de cada ejecuci
 COOLDOWN = int(os.getenv("COOLDOWN_S", "900"))       # no repetir aviso del mismo avión
 MAX_LOC_AGE = int(os.getenv("MAX_LOC_AGE_S", "600")) # ubicación más vieja que esto = ignorar
 PHOTO_MODE = os.getenv("PHOTO_MODE", "preview")      # "preview" = enlace con vista previa; "photo" = sendPhoto
+ONLY_HELI = os.getenv("ONLY_HELICOPTERS", "0") == "1"  # 0 = aviones y helicópteros; 1 = solo helicópteros
+
+# Un helicóptero se detecta por la categoría ADS-B "A7" (rotorcraft) o, si el
+# avión no la emite, por su código de tipo OACI. Amplía la lista con HELI_TYPES=AAA,BBB
+HELI_TYPES = {
+    "EC20", "EC25", "EC30", "EC35", "EC45", "EC55", "EC75", "H160", "H175",
+    "AS32", "AS3B", "AS50", "AS55", "AS65", "PUMA", "GAZL", "ALO2", "ALO3", "LAMA", "ALOU",
+    "B06", "B407", "B412", "B429", "B430", "B212", "B222", "B230", "B47G", "B47J", "B105",
+    "B427", "B505", "B204", "B205", "B214", "UH1", "BK17",
+    "R22", "R44", "R66", "A109", "A119", "A139", "A149", "A169", "A189", "A129",
+    "S76", "S92", "S61", "S58", "S64", "S70", "H47", "H64", "H60", "H53", "H46", "H500", "H269",
+    "MI8", "MI17", "MI24", "MI26", "KA32", "KA27", "KA26", "NH90", "EH10",
+    "EN28", "EN48", "MD52", "MD60", "MD90",
+} | {t.strip().upper() for t in os.getenv("HELI_TYPES", "").split(",") if t.strip()}
 
 # Planespotters exige un User-Agent único con URL o email de contacto.
 # En GitHub Actions GITHUB_REPOSITORY existe solo (usuario/repositorio).
@@ -153,10 +167,15 @@ def fetch_aircraft(lat, lon):
     return None
 
 
+def is_helicopter(ac):
+    return ac.get("category") == "A7" or (ac.get("t") or "").upper() in HELI_TYPES
+
+
 def format_msg(ac, dist, brg):
     flight = (ac.get("flight") or "").strip() or "sin indicativo"
+    head = "🚁 HELICÓPTERO ·" if is_helicopter(ac) else "✈️"
     lines = [
-        f"✈️ {flight} ({ac.get('t') or '?'}, {ac.get('r') or '?'})",
+        f"{head} {flight} ({ac.get('t') or '?'}, {ac.get('r') or '?'})",
         f"📏 A {dist:.1f} km al {compass(brg)}",
         f"⬇️ {ac['alt_baro'] * 0.3048:.0f} m ({int(ac['alt_baro'])} ft)",
     ]
@@ -223,6 +242,9 @@ def alert_user(cid, lat, lon, seen):
             continue
         dist = haversine_km(lat, lon, ac["lat"], ac["lon"])
         if dist > RADIUS_KM:
+            continue
+        if ONLY_HELI and not is_helicopter(ac):
+            print(f"Ignorado (no es helicóptero): tipo={ac.get('t')} categoría={ac.get('category')}")
             continue
         key = (cid, ac["hex"])
         if now - seen.get(key, 0) < COOLDOWN:
