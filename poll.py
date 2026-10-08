@@ -187,29 +187,42 @@ def format_msg(ac, dist, brg):
     return "\n".join(lines)
 
 
-def get_photo(hex_code):
-    """Última foto del avión en Planespotters.net (API pública, sin clave)."""
+def _planespotters(kind, value):
+    """Consulta la API de Planespotters por 'hex' o 'reg'. Devuelve (foto, página, autor) o None."""
+    url = f"https://api.planespotters.net/pub/photos/{kind}/{urllib.parse.quote(value)}"
+    photos = http_json(url, timeout=10).get("photos") or []
+    if photos:
+        p = photos[0]
+        thumb = p.get("thumbnail_large") or p.get("thumbnail") or {}
+        if thumb.get("src") and p.get("link"):
+            return (thumb["src"], p["link"], p.get("photographer") or "autor desconocido")
+    return None
+
+
+def get_photo(hex_code, reg=None):
+    """Última foto del avión: primero por código hex y, si no hay, por matrícula."""
     if hex_code in photo_cache:
         return photo_cache[hex_code]
-    result = None
-    try:
-        data = http_json(f"https://api.planespotters.net/pub/photos/hex/{hex_code.upper()}", timeout=10)
-        photos = data.get("photos") or []
-        if photos:
-            p = photos[0]
-            thumb = p.get("thumbnail_large") or p.get("thumbnail") or {}
-            if thumb.get("src") and p.get("link"):
-                result = (thumb["src"], p["link"], p.get("photographer") or "autor desconocido")
-    except Exception as e:
-        print(f"Foto no disponible ({hex_code}): {e}", file=sys.stderr)
-        return None  # no se cachea el fallo: se reintenta la próxima vez
-    print(f"Foto {hex_code}: " + ("encontrada" if result else "sin foto en Planespotters"))
-    photo_cache[hex_code] = result
+    result, failed = None, False
+    for kind, value in (("hex", hex_code.upper()), ("reg", reg)):
+        if not value:
+            continue
+        try:
+            result = _planespotters(kind, value)
+        except Exception as e:
+            failed = True
+            print(f"Foto por {kind} no disponible: {e}", file=sys.stderr)
+            continue
+        if result:
+            break
+    print("Foto: " + ("encontrada" if result else ("error al consultar Planespotters" if failed else "sin foto en Planespotters")))
+    if result or not failed:  # un error de red/403 no se cachea: se reintentará
+        photo_cache[hex_code] = result
     return result
 
 
-def send_alert(chat_id, hex_code, text):
-    photo = get_photo(hex_code)
+def send_alert(chat_id, hex_code, text, reg=None):
+    photo = get_photo(hex_code, reg)
     if photo:
         src, link, author = photo
         credit = f"📷 {author} · Planespotters.net"
@@ -225,8 +238,9 @@ def send_alert(chat_id, hex_code, text):
                link_preview_options=json.dumps({"url": link, "prefer_large_media": True}))
             return
         except Exception as e:
-            print(f"Vista previa falló, envío solo texto: {e}", file=sys.stderr)
-    tg("sendMessage", chat_id=chat_id, text=text, disable_web_page_preview="true")
+            print(f"Vista previa falló, envío sin foto: {e}", file=sys.stderr)
+    tg("sendMessage", chat_id=chat_id, text=f"{text}\n📷 FOTO NO DISPONIBLE",
+       disable_web_page_preview="true")
 
 
 def alert_user(cid, lat, lon, seen):
@@ -250,7 +264,7 @@ def alert_user(cid, lat, lon, seen):
         if now - seen.get(key, 0) < COOLDOWN:
             continue
         brg = bearing(lat, lon, ac["lat"], ac["lon"])
-        send_alert(cid, ac["hex"], format_msg(ac, dist, brg))
+        send_alert(cid, ac["hex"], format_msg(ac, dist, brg), ac.get("r"))
         seen[key] = now
 
 
