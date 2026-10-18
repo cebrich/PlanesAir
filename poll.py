@@ -239,6 +239,17 @@ def send_alert(chat_id, hex_code, text, reg=None):
             return
         except Exception as e:
             print(f"Vista previa falló, envío sin foto: {e}", file=sys.stderr)
+    # Sin foto en Planespotters: enlace a la página de la matrícula en JetPhotos
+    # (no hay API pública; es solo un enlace que se abre en tu navegador).
+    if reg:
+        jp = f"https://www.jetphotos.com/registration/{urllib.parse.quote(reg)}"
+        try:
+            tg("sendMessage", chat_id=chat_id,
+               text=f"{text}\n📷 FOTO NO DISPONIBLE · Ver en JetPhotos:\n{jp}",
+               disable_web_page_preview="true")
+            return
+        except Exception as e:
+            print(f"Enlace JetPhotos falló, envío sin foto: {e}", file=sys.stderr)
     tg("sendMessage", chat_id=chat_id, text=f"{text}\n📷 FOTO NO DISPONIBLE",
        disable_web_page_preview="true")
 
