@@ -8,6 +8,7 @@ real con el bot: no hace falta apuntar sus ids en ningún sitio."""
 import json
 import math
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -221,6 +222,15 @@ def get_photo(hex_code, reg=None):
     return result
 
 
+def photo_page_link(reg):
+    """Enlace donde ver fotos de la aeronave: primero Flightradar24; si no, JetPhotos."""
+    if not reg:
+        return None
+    if re.fullmatch(r"[A-Za-z0-9-]{2,10}", reg):
+        return ("Flightradar24", f"https://www.flightradar24.com/data/aircraft/{reg.lower()}")
+    return ("JetPhotos", f"https://www.jetphotos.com/registration/{urllib.parse.quote(reg)}")
+
+
 def send_alert(chat_id, hex_code, text, reg=None):
     photo = get_photo(hex_code, reg)
     if photo:
@@ -239,17 +249,18 @@ def send_alert(chat_id, hex_code, text, reg=None):
             return
         except Exception as e:
             print(f"Vista previa falló, envío sin foto: {e}", file=sys.stderr)
-    # Sin foto en Planespotters: enlace a la página de la matrícula en JetPhotos
-    # (no hay API pública; es solo un enlace que se abre en tu navegador).
-    if reg:
-        jp = f"https://www.jetphotos.com/registration/{urllib.parse.quote(reg)}"
+    # Sin foto en Planespotters: enlace a la ficha de la aeronave (con sus fotos) para abrirlo
+    # en tu navegador. No se accede a esas webs desde el script, solo se construye el enlace.
+    link = photo_page_link(reg)
+    if link:
+        label, url = link
         try:
             tg("sendMessage", chat_id=chat_id,
-               text=f"{text}\n📷 FOTO NO DISPONIBLE · Ver en JetPhotos:\n{jp}",
+               text=f"{text}\n📷 FOTO NO DISPONIBLE · Ver en {label}:\n{url}",
                disable_web_page_preview="true")
             return
         except Exception as e:
-            print(f"Enlace JetPhotos falló, envío sin foto: {e}", file=sys.stderr)
+            print(f"Enlace de fotos falló, envío sin enlace: {e}", file=sys.stderr)
     tg("sendMessage", chat_id=chat_id, text=f"{text}\n📷 FOTO NO DISPONIBLE",
        disable_web_page_preview="true")
 
