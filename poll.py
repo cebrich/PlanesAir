@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""Avisa por Telegram de aviones y helicópteros (ONLY_HELICOPTERS=1 limita a helicópteros) a <= RADIUS_KM de la ubicación en vivo de cada
-usuario autorizado y por debajo de MAX_ALT_FT. Solo usa la librería estándar.
+"""Avisa por Telegram de aviones y helicópteros a <= RADIUS_KM de la ubicación en vivo
+de cada usuario autorizado y por debajo de MAX_ALT_FT. Solo usa la librería estándar.
 
 Usuarios: el dueño (TELEGRAM_CHAT_ID) y, opcionalmente, los miembros del grupo
 TELEGRAM_GROUP_ID. Cada uno se "suscribe" compartiendo su ubicación en tiempo
-real con el bot: no hace falta apuntar sus ids en ningún sitio."""
+real con el bot: no hace falta apuntar sus ids en ningún sitio.
+
+Cada usuario elige qué recibir con comandos (/helicopteros, /aviones, /todo, /estado).
+Sin elegir nada, recibe solo helicópteros (DEFAULT_MODE). El modo elegido se guarda en
+STATE_FILE; en GitHub Actions lo conserva la caché entre ejecuciones."""
 import json
 import math
 import os
 import re
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -25,7 +30,15 @@ DURATION = int(os.getenv("DURATION_S", "3300"))      # duración de cada ejecuci
 COOLDOWN = int(os.getenv("COOLDOWN_S", "900"))       # no repetir aviso del mismo avión
 MAX_LOC_AGE = int(os.getenv("MAX_LOC_AGE_S", "600")) # ubicación más vieja que esto = ignorar
 PHOTO_MODE = os.getenv("PHOTO_MODE", "preview")      # "preview" = enlace con vista previa; "photo" = sendPhoto
-ONLY_HELI = os.getenv("ONLY_HELICOPTERS", "0") == "1"  # 0 = aviones y helicópteros; 1 = solo helicópteros
+MODES = {
+    "helicopteros": "solo helicópteros 🚁",
+    "aviones": "solo aviones ✈️",
+    "todo": "aviones y helicópteros ✈️🚁",
+}
+DEFAULT_MODE = os.getenv("DEFAULT_MODE", "helicopteros").strip().lower()  # modo si el usuario no elige
+if DEFAULT_MODE not in MODES:
+    DEFAULT_MODE = "helicopteros"
+STATE_FILE = os.getenv("STATE_FILE", "state.json")   # modos, ubicaciones y último update leído
 
 # Un helicóptero se detecta por la categoría ADS-B "A7" (rotorcraft) o, si el
 # avión no la emite, por su código de tipo OACI. Amplía la lista con HELI_TYPES=AAA,BBB
@@ -61,6 +74,9 @@ locations = {}     # chat_id -> (lat, lon, timestamp) de cada usuario
 member_cache = {}  # user_id -> (autorizado, cuándo se comprobó)
 notified = set()   # usuarios no autorizados ya avisados en esta ejecución
 photo_cache = {}  # hex -> (url_foto, url_pagina, fotógrafo) o None
+modes = {}         # chat_id -> "helicopteros" | "aviones" | "todo" (si falta, DEFAULT_MODE)
+last_update_id = None  # último update de Telegram ya procesado
+_saved = ""        # último contenido guardado en STATE_FILE
 
 
 def http_json(url, data=None, timeout=15):
@@ -98,33 +114,158 @@ def authorized(uid):
     return ok
 
 
-def refresh_locations():
-    """Lee los últimos 100 updates (offset negativo: sin consumir ni perder estado)
-    y guarda la ubicación más reciente de cada usuario autorizado."""
-    res = tg("getUpdates", offset=-100, limit=100,
-             allowed_updates=json.dumps(["message", "edited_message"]))
-    for u in res.get("result", []):
-        m = u.get("edited_message") or u.get("message")
-        if not m or "location" not in m or m["chat"].get("type") != "private":
-            continue
-        uid = (m.get("from") or {}).get("id")
-        if uid is None:
-            continue
-        cid = str(m["chat"]["id"])
-        ts = m.get("edit_date") or m["date"]
-        if cid in locations and locations[cid][2] >= ts:
-            continue
-        if not authorized(uid):
-            if cid not in notified:
-                notified.add(cid)
-                try:
-                    tg("sendMessage", chat_id=cid,
-                       text="Este bot es privado. Pide al administrador que te añada al grupo.")
-                except Exception as e:
-                    print(f"No se pudo avisar a un usuario no autorizado: {e}", file=sys.stderr)
-            continue
+def load_state():
+    """Recupera modos, ubicaciones y último update leído (en Actions, de la caché)."""
+    global last_update_id, _saved
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            raw = f.read()
+        st = json.loads(raw)
+        last_update_id = st.get("last_update_id")
+        modes.update({str(k): v for k, v in st.get("modes", {}).items() if v in MODES})
+        for k, v in st.get("locations", {}).items():
+            locations[str(k)] = (float(v[0]), float(v[1]), int(v[2]))
+        _saved = raw
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception as e:
+        print(f"Estado ilegible, empiezo de cero: {e}", file=sys.stderr)
+        return False
+
+
+def save_state():
+    global _saved
+    raw = json.dumps({"last_update_id": last_update_id, "modes": modes,
+                      "locations": {k: list(v) for k, v in locations.items()}})
+    if raw == _saved:
+        return
+    try:
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(raw)
+        os.replace(tmp, STATE_FILE)
+        _saved = raw
+    except Exception as e:
+        print(f"No se pudo guardar el estado: {e}", file=sys.stderr)
+
+
+HELP = (
+    "Comandos:\n"
+    "/helicopteros · solo helicópteros 🚁\n"
+    "/aviones · solo aviones ✈️\n"
+    "/todo · aviones y helicópteros\n"
+    "/estado · ver el modo actual\n\n"
+    "Para recibir avisos, comparte tu ubicación en tiempo real con este chat."
+)
+COMMANDS = {
+    "/helicopteros": "helicopteros", "/helicoptero": "helicopteros",
+    "/aviones": "aviones", "/avion": "aviones",
+    "/todo": "todo", "/todos": "todo",
+}
+
+
+def norm_cmd(text):
+    """'/Helicópteros@mi_bot arg' -> '/helicopteros' (sin acentos, mayúsculas ni @bot)."""
+    cmd = text.split()[0].split("@")[0].lower()
+    return "".join(c for c in unicodedata.normalize("NFKD", cmd) if not unicodedata.combining(c))
+
+
+def status_text(cid):
+    txt = f"Modo actual: {MODES[modes.get(cid, DEFAULT_MODE)]}"
+    loc = locations.get(cid)
+    if loc and time.time() - loc[2] <= MAX_LOC_AGE:
+        return txt + "\n📍 Ubicación: activa"
+    return txt + "\n📍 Ubicación: sin datos recientes (comparte la ubicación en tiempo real)"
+
+
+def handle_command(cid, text, reply):
+    cmd = norm_cmd(text)
+    if cmd in COMMANDS:
+        modes[cid] = COMMANDS[cmd]
+        msg = f"✅ Modo: {MODES[modes[cid]]}"
+    elif cmd == "/estado":
+        msg = status_text(cid)
+    else:  # /start, /ayuda, /help o cualquier otro
+        msg = f"{HELP}\n\n{status_text(cid)}"
+    if reply:
+        try:
+            tg("sendMessage", chat_id=cid, text=msg)
+        except Exception as e:
+            print(f"No se pudo responder a un comando: {e}", file=sys.stderr)
+
+
+def register_commands():
+    """Muestra los comandos en el menú '/' de Telegram."""
+    try:
+        tg("setMyCommands", commands=json.dumps([
+            {"command": "helicopteros", "description": "Avisar solo de helicópteros 🚁"},
+            {"command": "aviones", "description": "Avisar solo de aviones ✈️"},
+            {"command": "todo", "description": "Avisar de aviones y helicópteros"},
+            {"command": "estado", "description": "Ver el modo actual"},
+        ]))
+    except Exception as e:
+        print(f"No se pudieron registrar los comandos: {e}", file=sys.stderr)
+
+
+def process_message(m, reply):
+    """Ubicación o comando de un chat privado. Los no autorizados reciben un aviso y se ignoran."""
+    if m["chat"].get("type") != "private":
+        return
+    uid = (m.get("from") or {}).get("id")
+    if uid is None:
+        return
+    cid = str(m["chat"]["id"])
+    text = (m.get("text") or "").strip()
+    is_cmd = text.startswith("/")
+    if "location" not in m and not is_cmd:
+        return
+    ts = m.get("edit_date") or m["date"]
+    if "location" in m and cid in locations and locations[cid][2] >= ts:
+        return
+    if not authorized(uid):
+        if cid not in notified:
+            notified.add(cid)
+            try:
+                tg("sendMessage", chat_id=cid,
+                   text="Este bot es privado. Pide al administrador que te añada al grupo.")
+            except Exception as e:
+                print(f"No se pudo avisar a un usuario no autorizado: {e}", file=sys.stderr)
+        return
+    if "location" in m:
         loc = m["location"]
         locations[cid] = (loc["latitude"], loc["longitude"], ts)
+    else:
+        handle_command(cid, text, reply)
+
+
+def process_updates():
+    """Lee los mensajes nuevos (y los confirma con offset). En la primera lectura sin estado
+    previo mira los últimos 100 y solo responde a comandos de los últimos 10 minutos."""
+    global last_update_id
+    first = last_update_id is None
+    offset = -100 if first else last_update_id + 1
+    now = time.time()
+    while True:
+        res = tg("getUpdates", offset=offset, limit=100,
+                 allowed_updates=json.dumps(["message", "edited_message"]))
+        updates = res.get("result", [])
+        if not updates:
+            break
+        for u in updates:
+            m = u.get("edited_message") or u.get("message")
+            if not m:
+                continue
+            reply = (not first) or (now - m.get("date", 0) < 600)
+            try:
+                process_message(m, reply)
+            except Exception as e:
+                print(f"Error procesando un mensaje: {e}", file=sys.stderr)
+        last_update_id = max(u["update_id"] for u in updates)
+        offset = last_update_id + 1
+        if len(updates) < 100:
+            break
+    save_state()
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -227,6 +368,106 @@ def photo_page_link(reg):
     if not reg:
         return None
     if re.fullmatch(r"[A-Za-z0-9-]{2,10}", reg):
+        return ("Flightradar24", f"https://www.flightradar24.com/data/aircraft/{reg.lower()}")
+    return ("JetPhotos", f"https://www.jetphotos.com/registration/{urllib.parse.quote(reg)}")
+
+
+def send_alert(chat_id, hex_code, text, reg=None):
+    photo = get_photo(hex_code, reg)
+    if photo:
+        src, link, author = photo
+        credit = f"📷 {author} · Planespotters.net"
+        if PHOTO_MODE == "photo":
+            try:
+                tg("sendPhoto", chat_id=chat_id, photo=src, caption=f"{text}\n{credit}\n{link}"[:1024])
+                return
+            except Exception as e:
+                print(f"sendPhoto falló, pruebo con vista previa del enlace: {e}", file=sys.stderr)
+        # Vista previa del enlace de la foto (Telegram muestra la imagen de la página)
+        try:
+            tg("sendMessage", chat_id=chat_id, text=f"{text}\n{credit}\n{link}",
+               link_preview_options=json.dumps({"url": link, "prefer_large_media": True}))
+            return
+        except Exception as e:
+            print(f"Vista previa falló, envío sin foto: {e}", file=sys.stderr)
+    # Sin foto en Planespotters: enlace a la ficha de la aeronave (con sus fotos) para abrirlo
+    # en tu navegador. No se accede a esas webs desde el script, solo se construye el enlace.
+    link = photo_page_link(reg)
+    if link:
+        label, url = link
+        try:
+            tg("sendMessage", chat_id=chat_id,
+               text=f"{text}\n📷 FOTO NO DISPONIBLE · Ver en {label}:\n{url}",
+               disable_web_page_preview="true")
+            return
+        except Exception as e:
+            print(f"Enlace de fotos falló, envío sin enlace: {e}", file=sys.stderr)
+    tg("sendMessage", chat_id=chat_id, text=f"{text}\n📷 FOTO NO DISPONIBLE",
+       disable_web_page_preview="true")
+
+
+def alert_user(cid, lat, lon, seen):
+    aircraft = fetch_aircraft(lat, lon)
+    if aircraft is None:
+        return
+    now = time.time()
+    mode = modes.get(cid, DEFAULT_MODE)
+    for ac in aircraft:
+        alt = ac.get("alt_baro")  # puede ser "ground" o faltar
+        if not isinstance(alt, (int, float)) or alt >= MAX_ALT_FT:
+            continue
+        if ac.get("lat") is None or ac.get("lon") is None or not ac.get("hex"):
+            continue
+        dist = haversine_km(lat, lon, ac["lat"], ac["lon"])
+        if dist > RADIUS_KM:
+            continue
+        heli = is_helicopter(ac)
+        if (mode == "helicopteros" and not heli) or (mode == "aviones" and heli):
+            print(f"Ignorado (modo {mode}): tipo={ac.get('t')} categoría={ac.get('category')}")
+            continue
+        key = (cid, ac["hex"])
+        if now - seen.get(key, 0) < COOLDOWN:
+            continue
+        brg = bearing(lat, lon, ac["lat"], ac["lon"])
+        send_alert(cid, ac["hex"], format_msg(ac, dist, brg), ac.get("r"))
+        seen[key] = now
+
+
+def step(seen):
+    process_updates()
+    now = time.time()
+    active = {cid: loc for cid, loc in locations.items() if now - loc[2] <= MAX_LOC_AGE}
+    if not active:
+        print("Sin ubicaciones recientes; comparte la ubicación en tiempo real con el bot.")
+        return
+    print(f"{len(active)} usuario(s) con ubicación reciente")
+    for i, (cid, (lat, lon, _)) in enumerate(active.items()):
+        if i:
+            time.sleep(1.1)  # las APIs permiten ~1 petición/segundo
+        try:
+            alert_user(cid, lat, lon, seen)
+        except Exception as e:  # un usuario con fallo no debe frenar a los demás
+            print(f"Error con un usuario: {e}", file=sys.stderr)
+
+
+def main():
+    print("Estado restaurado" if load_state() else "Sin estado previo: valores por defecto")
+    register_commands()
+    seen = {}
+    end = time.time() + DURATION
+    while True:
+        t0 = time.time()
+        try:
+            step(seen)
+        except Exception as e:
+            print(f"Error en el ciclo: {e}", file=sys.stderr)
+        if time.time() + INTERVAL > end:
+            break
+        time.sleep(max(0, INTERVAL - (time.time() - t0)))
+
+
+if __name__ == "__main__":
+    main(), reg):
         return ("Flightradar24", f"https://www.flightradar24.com/data/aircraft/{reg.lower()}")
     return ("JetPhotos", f"https://www.jetphotos.com/registration/{urllib.parse.quote(reg)}")
 
