@@ -16,6 +16,16 @@ jobs:
     timeout-minutes: 59
     steps:
       - uses: actions/checkout@v4
+
+      # Conserva entre ejecuciones el modo elegido con los comandos, las ubicaciones
+      # y el último mensaje leído. Cada ejecución guarda una caché nueva y restaura la última.
+      - name: Restaurar estado
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: aviones-state-${{ github.run_id }}
+          restore-keys: aviones-state-
+
       - name: Vigilar aviones
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -23,5 +33,5 @@ jobs:
           TELEGRAM_GROUP_ID: ${{ secrets.TELEGRAM_GROUP_ID }}  # opcional
           DURATION_S: "3300"
           PHOTO_MODE: "preview"
-          ONLY_HELICOPTERS: "0"   # 0 = aviones y helicópteros; 1 = solo helicópteros
+          DEFAULT_MODE: "helicopteros"   # sin comando: helicopteros | aviones | todo
         run: python3 poll.py
