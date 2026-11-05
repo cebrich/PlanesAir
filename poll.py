@@ -8,7 +8,12 @@ real con el bot: no hace falta apuntar sus ids en ningún sitio.
 
 Cada usuario elige qué recibir con comandos (/helicopteros, /aviones, /todo, /estado).
 Sin elegir nada, recibe solo helicópteros (DEFAULT_MODE). El modo elegido se guarda en
-STATE_FILE; en GitHub Actions lo conserva la caché entre ejecuciones."""
+STATE_FILE; en GitHub Actions lo conserva la caché entre ejecuciones.
+
+Ubicación del dueño desde el móvil (p. ej. Automate al conectar el Bluetooth del coche):
+si hay LOCATION_TOKEN, el script lee cada ciclo la variable de repositorio LOCATION_VAR
+(valor "lat;lon;ts") y la usa como ubicación del dueño si es más reciente que la de Telegram."""
+import calendar
 import json
 import math
 import os
@@ -39,6 +44,9 @@ DEFAULT_MODE = os.getenv("DEFAULT_MODE", "helicopteros").strip().lower()  # modo
 if DEFAULT_MODE not in MODES:
     DEFAULT_MODE = "helicopteros"
 STATE_FILE = os.getenv("STATE_FILE", "state.json")   # modos, ubicaciones y último update leído
+LOC_TOKEN = os.getenv("LOCATION_TOKEN", "").strip()  # token fine-grained: solo permiso "Variables" de este repo
+LOC_REPO = os.getenv("LOCATION_REPO") or os.getenv("GITHUB_REPOSITORY", "")  # usuario/repositorio
+LOC_VAR = os.getenv("LOCATION_VAR", "UBICACION")     # nombre de la variable que actualiza el móvil
 
 # Un helicóptero se detecta por la categoría ADS-B "A7" (rotorcraft) o, si el
 # avión no la emite, por su código de tipo OACI. Amplía la lista con HELI_TYPES=AAA,BBB
@@ -76,6 +84,7 @@ notified = set()   # usuarios no autorizados ya avisados en esta ejecución
 photo_cache = {}  # hex -> (url_foto, url_pagina, fotógrafo) o None
 modes = {}         # chat_id -> "helicopteros" | "aviones" | "todo" (si falta, DEFAULT_MODE)
 last_update_id = None  # último update de Telegram ya procesado
+loc_etag = None    # ETag de la variable de ubicación (peticiones condicionales)
 _saved = ""        # último contenido guardado en STATE_FILE
 
 
@@ -268,6 +277,69 @@ def process_updates():
     save_state()
 
 
+def parse_location_value(value):
+    """'lat;lon;ts' (o 'lat,lon,ts'); admite coma decimal. Devuelve (lat, lon, ts|None) o None."""
+    raw = (value or "").strip()
+    parts = raw.split(";") if ";" in raw else raw.split(",")
+    if len(parts) < 2:
+        return None
+    lat, lon = (float(p.strip().replace(",", ".")) for p in parts[:2])
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    ts = None
+    if len(parts) > 2:
+        try:
+            ts = float(parts[2].strip().replace(",", "."))
+            if ts > 1e11:  # milisegundos
+                ts /= 1000
+        except ValueError:
+            pass
+    return lat, lon, ts
+
+
+def refresh_variable_location():
+    """Ubicación del dueño enviada desde el móvil a una variable del repositorio.
+    La frescura se mide con la hora que GitHub anota al actualizarla (updated_at)."""
+    global loc_etag
+    if not (LOC_TOKEN and LOC_REPO):
+        return
+    headers = {"User-Agent": USER_AGENT, "Authorization": f"Bearer {LOC_TOKEN}",
+               "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+    if loc_etag:
+        headers["If-None-Match"] = loc_etag
+    url = f"https://api.github.com/repos/{LOC_REPO}/actions/variables/{urllib.parse.quote(LOC_VAR)}"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=15) as r:
+            etag = r.headers.get("ETag")
+            data = json.load(r)
+    except urllib.error.HTTPError as e:
+        if e.code != 304:  # 304 = sin cambios
+            print(f"Variable de ubicación: HTTP {e.code}", file=sys.stderr)
+        return
+    except Exception as e:
+        print(f"Variable de ubicación: {e}", file=sys.stderr)
+        return
+    loc_etag = etag
+    try:
+        parsed = parse_location_value(data.get("value"))
+    except ValueError:
+        parsed = None
+    if parsed is None:
+        print("Variable de ubicación: valor no válido", file=sys.stderr)
+        return
+    lat, lon, ts = parsed
+    if lat == 0 and lon == 0:  # valor inicial "0;0;0"
+        return
+    try:
+        upd = calendar.timegm(time.strptime(data.get("updated_at", ""), "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        upd = None
+    ts = int(min(upd or ts or time.time(), time.time()))
+    cur = locations.get(CHAT_ID)
+    if cur is None or cur[2] < ts:
+        locations[CHAT_ID] = (lat, lon, ts)
+
+
 def haversine_km(lat1, lon1, lat2, lon2):
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dphi, dl = p2 - p1, math.radians(lon2 - lon1)
@@ -435,6 +507,8 @@ def alert_user(cid, lat, lon, seen):
 
 def step(seen):
     process_updates()
+    refresh_variable_location()
+    save_state()
     now = time.time()
     active = {cid: loc for cid, loc in locations.items() if now - loc[2] <= MAX_LOC_AGE}
     if not active:
