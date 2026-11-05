@@ -2,7 +2,7 @@ name: aviones
 
 on:
   schedule:
-    - cron: "0 * * * *"   # cada hora; cada ejecución hace bucle ~55 min
+    - cron: "*/15 * * * *"   # cada 15 min; con la cola de concurrency siempre hay una ejecución pendiente
   workflow_dispatch:
 
 # Si una ejecución se retrasa, la siguiente espera en vez de solaparse
