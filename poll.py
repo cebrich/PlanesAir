@@ -47,6 +47,7 @@ STATE_FILE = os.getenv("STATE_FILE", "state.json")   # modos, ubicaciones y últ
 LOC_TOKEN = os.getenv("LOCATION_TOKEN", "").strip()  # token fine-grained: solo permiso "Variables" de este repo
 LOC_REPO = os.getenv("LOCATION_REPO") or os.getenv("GITHUB_REPOSITORY", "")  # usuario/repositorio
 LOC_VAR = os.getenv("LOCATION_VAR", "UBICACION")     # nombre de la variable que actualiza el móvil
+STATE_VAR = os.getenv("STATE_VAR", "ESTADO")        # variable del repo donde se guardan modos y último update
 
 # Un helicóptero se detecta por la categoría ADS-B "A7" (rotorcraft) o, si el
 # avión no la emite, por su código de tipo OACI. Amplía la lista con HELI_TYPES=AAA,BBB
@@ -86,6 +87,7 @@ modes = {}         # chat_id -> "helicopteros" | "aviones" | "todo" (si falta, D
 last_update_id = None  # último update de Telegram ya procesado
 loc_etag = None    # ETag de la variable de ubicación (peticiones condicionales)
 _saved = ""        # último contenido guardado en STATE_FILE
+_remote_saved = ""  # último estado enviado a la variable del repositorio
 
 
 def http_json(url, data=None, timeout=15):
@@ -123,8 +125,86 @@ def authorized(uid):
     return ok
 
 
+def gh_var(method, name=None, body=None):
+    """Llamada a la API de variables del repositorio (mismo token que la ubicación)."""
+    url = f"https://api.github.com/repos/{LOC_REPO}/actions/variables"
+    if name:
+        url += "/" + urllib.parse.quote(name)
+    headers = {"User-Agent": USER_AGENT, "Authorization": f"Bearer {LOC_TOKEN}",
+               "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        raw = r.read()
+    return json.loads(raw) if raw else {}
+
+
+def state_blob():
+    return json.dumps({"last_update_id": last_update_id, "modes": modes}, sort_keys=True)
+
+
+def load_remote_state():
+    """Modos y último update guardados en la variable ESTADO (sobreviven a la caché)."""
+    global last_update_id, _remote_saved
+    if not (LOC_TOKEN and LOC_REPO):
+        return False
+    try:
+        data = gh_var("GET", STATE_VAR)
+    except urllib.error.HTTPError as e:
+        if e.code != 404:  # 404 = aún no existe; se crea al guardar
+            print(f"Variable de estado: HTTP {e.code}", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"Variable de estado: {e}", file=sys.stderr)
+        return False
+    try:
+        st = json.loads(data.get("value") or "{}")
+        modes.update({str(k): v for k, v in st.get("modes", {}).items() if v in MODES})
+        lid = st.get("last_update_id")
+        if isinstance(lid, int) and (last_update_id is None or lid > last_update_id):
+            last_update_id = lid
+    except Exception as e:
+        print(f"Variable de estado ilegible: {e}", file=sys.stderr)
+        return False
+    if json.dumps(st, sort_keys=True) == state_blob():
+        _remote_saved = state_blob()
+    return True
+
+
+def push_remote_state():
+    """Guarda modos y último update en la variable ESTADO solo cuando cambian."""
+    global _remote_saved
+    if not (LOC_TOKEN and LOC_REPO):
+        return
+    blob = state_blob()
+    if blob == _remote_saved:
+        return
+    body = {"name": STATE_VAR, "value": blob}
+    try:
+        try:
+            gh_var("PATCH", STATE_VAR, body)
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            gh_var("POST", None, body)  # primera vez: la crea
+        _remote_saved = blob
+    except urllib.error.HTTPError as e:
+        print(f"No se pudo guardar la variable de estado: HTTP {e.code}", file=sys.stderr)
+    except Exception as e:
+        print(f"No se pudo guardar la variable de estado: {e}", file=sys.stderr)
+
+
 def load_state():
-    """Recupera modos, ubicaciones y último update leído (en Actions, de la caché)."""
+    """Estado de la caché de Actions, completado con la variable ESTADO del repositorio."""
+    ok = load_file_state()
+    return load_remote_state() or ok
+
+
+def load_file_state():
+    """Recupera modos, ubicaciones y último update leído de STATE_FILE."""
     global last_update_id, _saved
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
@@ -509,6 +589,7 @@ def step(seen):
     process_updates()
     refresh_variable_location()
     save_state()
+    push_remote_state()
     now = time.time()
     active = {cid: loc for cid, loc in locations.items() if now - loc[2] <= MAX_LOC_AGE}
     if not active:
