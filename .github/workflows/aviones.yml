@@ -2,13 +2,17 @@ name: aviones
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # cada 15 min; con la cola de concurrency siempre hay una ejecución pendiente
+    - cron: "*/15 * * * *"   # respaldo: GitHub retrasa o se salta a menudo los cron
   workflow_dispatch:
 
-# Si una ejecución se retrasa, la siguiente espera en vez de solaparse
+# Solo una ejecución a la vez; la siguiente espera en cola en vez de solaparse
 concurrency:
   group: aviones
   cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write   # para que cada ejecución pueda lanzar la siguiente
 
 jobs:
   poll:
@@ -36,3 +40,13 @@ jobs:
           PHOTO_MODE: "preview"
           DEFAULT_MODE: "helicopteros"   # sin comando: helicopteros | aviones | todo
         run: python3 poll.py
+
+      # Encadena la siguiente ejecución: queda en cola y arranca en cuanto termine esta.
+      # La pausa evita un bucle rápido si algo fallara al arrancar.
+      - name: Lanzar la siguiente ejecución
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sleep 30
+          gh workflow run aviones.yml --ref "${{ github.ref_name }}" --repo "${{ github.repository }}"
