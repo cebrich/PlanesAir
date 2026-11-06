@@ -15,12 +15,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 59
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Conserva entre ejecuciones el modo elegido con los comandos, las ubicaciones
       # y el último mensaje leído. Cada ejecución guarda una caché nueva y restaura la última.
       - name: Restaurar estado
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: state.json
           key: aviones-state-${{ github.run_id }}
