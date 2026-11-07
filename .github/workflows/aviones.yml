@@ -39,7 +39,6 @@ jobs:
           DURATION_S: "3300"
           PHOTO_MODE: "preview"
           DEFAULT_MODE: "helicopteros"   # sin comando: helicopteros | aviones | todo
-          PYTHONUNBUFFERED: "1"
         run: python3 poll.py
 
       # Encadena la siguiente ejecución: queda en cola y arranca en cuanto termine esta.
